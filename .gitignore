@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific - Large files
+BD_New_DKC/
+BD_New_DKC-20260414T013015Z-3-001/
+BD_New_DKC-20260414T013015Z-3-001.zip
+best_model.pth
+output_video.avi
+*.avi
+*.mp4
+
+# Lingma
+.lingma/
