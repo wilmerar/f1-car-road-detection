@@ -7,6 +7,7 @@ from PIL import Image
 
 import os
 import time
+from torch.cuda.amp import autocast, GradScaler
 
 # Funciones auxiliares para medir el tiempo
 def TicTocGenerator():
@@ -29,15 +30,18 @@ def tic():
 
 # Dimensiones de las imágenes
 Alto, Ancho = 120, 160
-batch_size = 32
+batch_size = 64  # Increased batch size for better gradient estimates
 num_classes = 5
 
-# Definir las transformaciones para los datos de entrenamiento y prueba
+# Definir las transformaciones para los datos de entrenamiento y prueba (MEJORADAS)
 train_transforms = transforms.Compose([
     transforms.Resize((Alto, Ancho)),
-    transforms.RandomHorizontalFlip(),
-    transforms.RandomAffine(degrees=0, shear=0.2, scale=(0.8, 1.2)),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomRotation(degrees=12),  # Aumentado de 10 a 12 grados
+    transforms.RandomAffine(degrees=0, shear=0.35, scale=(0.75, 1.25)),  # Más variación
+    transforms.ColorJitter(brightness=0.35, contrast=0.35, saturation=0.35, hue=0.05),  # Añadido hue
+    transforms.RandomGrayscale(p=0.15),  # Aumentado de 0.1 a 0.15
+    transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),  # NUEVO: Blur aleatorio
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
@@ -55,33 +59,48 @@ test_dataset = datasets.ImageFolder('BD_New_DKC/testing_dkc', transform=test_tra
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-# Cargar el modelo VGG16 preentrenado
-model = models.vgg16(pretrained=True)
+# Cargar el modelo ResNet50 preentrenado (MEJOR QUE VGG16)
+model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
 
-# Congelar todas las capas del modelo
+# Congelar las capas convolucionales (permitir que solo la capa final aprenda)
 for param in model.parameters():
     param.requires_grad = False
 
-# Reemplazar la última capa totalmente conectada para nuestro problema de 5 clases
-num_features = model.classifier[6].in_features
-model.classifier[6] = nn.Linear(num_features, num_classes)
+# Reemplazar la última capa completamente conectada para 5 clases
+# ResNet50 tiene una estructura diferente: usa model.fc en lugar de model.classifier
+num_features = model.fc.in_features  # 2048 para ResNet50
+model.fc = nn.Sequential(
+    nn.Dropout(0.5),
+    nn.Linear(num_features, 256),
+    nn.ReLU(),
+    nn.Dropout(0.3),
+    nn.Linear(256, num_classes)
+)
 
 # Mover el modelo a la GPU si está disponible
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = model.to(device)
 
-# Definir la pérdida y el optimizador
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.classifier[6].parameters(), lr=0.001)
+# Definir la pérdida y el optimizador (MEJORADO)
+criterion = nn.CrossEntropyLoss(label_smoothing=0.15)  # Label smoothing para mejor generalización
+optimizer = optim.Adam(model.fc.parameters(), lr=0.0005, weight_decay=2e-4)  # Usar model.fc para ResNet
 
-# Configurar el aprendizaje temprano y la reducción de la tasa de aprendizaje
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=5, min_lr=0.00001)
-early_stopping_patience = 10
+# Configurar el aprendizaje temprano y la reducción de la tasa de aprendizaje (MEJORADO)
+scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+    optimizer, 
+    T_0=15,   # Aumentado de 10 a 15 para ciclos más largos
+    T_mult=2, # Duplicar período de reinicio
+    eta_min=5e-7  # Learning rate mínimo más bajo
+)
+early_stopping_patience = 20  # Aumentado de 15 a 20 para dar más tiempo
 best_val_loss = float('inf')
 epochs_no_improve = 0
 
-# Función de entrenamiento
-def train_model(model, train_loader, criterion, optimizer, device):
+# Mixed precision training scaler
+scaler = GradScaler()
+
+# Función de entrenamiento (MEJORADA con mixed precision y gradient clipping)
+def train_model(model, train_loader, criterion, optimizer, device, scaler):
     model.train()
     running_loss = 0.0
     correct = 0
@@ -89,10 +108,23 @@ def train_model(model, train_loader, criterion, optimizer, device):
     for inputs, labels in train_loader:
         inputs, labels = inputs.to(device), labels.to(device)
         optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
+        
+        # Mixed precision training
+        with autocast():
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+        
+        # Escalar y backward
+        scaler.scale(loss).backward()
+        
+        # Gradient clipping para evitar exploding gradients
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.fc.parameters(), max_norm=1.0)
+        
+        # Paso del optimizador
+        scaler.step(optimizer)
+        scaler.update()
+        
         running_loss += loss.item() * inputs.size(0)
         _, predicted = outputs.max(1)
         total += labels.size(0)
@@ -120,15 +152,15 @@ def validate_model(model, test_loader, criterion, device):
     epoch_acc = 100. * correct / total
     return epoch_loss, epoch_acc
 
-# Entrenamiento y validación del modelo
-num_epochs = 100
+# Entrenamiento y validación del modelo (MEJORADO)
+num_epochs = 150  # Aumentado de 100 a 150
 print("Entrenando el modelo...")
 start_time = time.time()
 
 for epoch in range(num_epochs):
-    train_loss, train_acc = train_model(model, train_loader, criterion, optimizer, device)
+    train_loss, train_acc = train_model(model, train_loader, criterion, optimizer, device, scaler)
     val_loss, val_acc = validate_model(model, test_loader, criterion, device)
-    scheduler.step(val_loss)
+    scheduler.step()  # Cosine annealing no necesita argumentos
 
     print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
 

@@ -3,8 +3,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import time
 import torch
 import matplotlib.pyplot as plt
-from torchvision.models import vgg16, VGG16_Weights
-from torchvision import transforms
+from torchvision import models, transforms
 from PIL import Image, ImageDraw
 import cv2
 import numpy as np
@@ -12,11 +11,18 @@ import numpy as np
 # Definir el dispositivo
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Cargar modelo VGG16 con pesos preentrenados
-weights = VGG16_Weights.DEFAULT
-model = vgg16(weights=weights)
-num_features = model.classifier[6].in_features
-model.classifier[6] = torch.nn.Linear(num_features, 5)
+# Cargar modelo ResNet50 con pesos preentrenados (MEJOR QUE VGG16)
+weights = models.ResNet50_Weights.IMAGENET1K_V2
+model = models.resnet50(weights=weights)
+# Reemplazar la última capa para 5 clases (misma arquitectura que en entrenamiento)
+num_features = model.fc.in_features  # 2048
+model.fc = torch.nn.Sequential(
+    torch.nn.Dropout(0.5),
+    torch.nn.Linear(num_features, 256),
+    torch.nn.ReLU(),
+    torch.nn.Dropout(0.3),
+    torch.nn.Linear(256, 5)
+)
 
 # Cargar pesos entrenados por el usuario
 model.load_state_dict(torch.load('best_model.pth', map_location=device))
@@ -178,9 +184,17 @@ for subfolder in subfolders:
     for i in range(0, len(image_files), 1):
         image_file = image_files[i]
 
-        # Predicción
+        # Obtener el ground truth de la carpeta (clase real)
+        # folder_path/testing_dkc/0/izq0117.png -> expected_class = 0
+        expected_class = int(os.path.basename(os.path.dirname(image_file)))
+
+        # Predicción del modelo
         result = predict_image(image_file, model, device)
-        print(f"Imagen: {os.path.basename(image_file)}, Prediccion: {result}")
+        
+        # VERIFICACIÓN REAL: ¿La predicción coincide con la clase esperada?
+        prediction_correct = (result == expected_class)
+        
+        print(f"Imagen: {os.path.basename(image_file)}, Predicción: {result}, Real: {expected_class}, {'✅' if prediction_correct else '❌'}")
 
         # Definir ángulo según clase
         angle_map = {0: 55, 1: 15, 2: 0, 3: -15, 4: -55}
@@ -190,95 +204,9 @@ for subfolder in subfolders:
         img = Image.open(image_file)
         img_width, img_height = img.size
 
-        # Verificar si el carro está en la pista usando detección mejorada
-        car_center_x = img_width // 2  # El carro está centrado horizontalmente
-        car_center_y = img_height - 35  # Centro vertical del carro
-        
-        # Detectar bordes de la pista usando múltiples métodos
-        img_cv = np.array(img)
-        img_gray_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2GRAY)
-        
-        # Aplicar blur para reducir ruido
-        img_blur = cv2.GaussianBlur(img_gray_cv, (5, 5), 0)
-        
-        # Detectar bordes con Canny
-        edges = cv2.Canny(img_blur, 50, 150)
-        
-        # Zona de interés: donde está el carro (parte inferior de la imagen)
-        roi_y = int(img_height * 0.5)
-        roi_height = int(img_height * 0.5)
-        roi = edges[roi_y:roi_y+roi_height, :]
-        roi_gray = img_gray_cv[roi_y:roi_y+roi_height, :]
-        
-        # Analizar múltiples filas para encontrar los bordes de la carretera
-        road_left_bound = 0
-        road_right_bound = img_width
-        
-        # Analizar desde la fila donde está el carro hacia arriba
-        car_row_in_roi = roi_height - 10  # Aproximadamente donde está el carro
-        num_rows_to_check = 30
-        
-        left_edges = []
-        right_edges = []
-        
-        for row_idx in range(max(0, car_row_in_roi - num_rows_to_check), min(roi_height, car_row_in_roi + 5)):
-            row = roi[row_idx, :]
-            edge_positions = np.where(row > 0)[0]
-            
-            if len(edge_positions) > 0:
-                # Filtrar para encontrar los bordes principales
-                groups = []
-                if len(edge_positions) > 0:
-                    current_group = [edge_positions[0]]
-                    
-                    for i in range(1, len(edge_positions)):
-                        if edge_positions[i] - edge_positions[i-1] < 15:
-                            current_group.append(edge_positions[i])
-                        else:
-                            groups.append(current_group)
-                            current_group = [edge_positions[i]]
-                    groups.append(current_group)
-                
-                # Si hay al menos 2 grupos, tomar el más izquierdo y derecho
-                if len(groups) >= 2:
-                    left_edges.append(int(np.mean(groups[0])))
-                    right_edges.append(int(np.mean(groups[-1])))
-                elif len(groups) == 1:
-                    # Si solo hay un grupo, podría ser un borde
-                    edge_pos = int(np.mean(groups[0]))
-                    if edge_pos < img_width // 2:
-                        left_edges.append(edge_pos)
-                    else:
-                        right_edges.append(edge_pos)
-        
-        # Calcular promedios de los bordes detectados
-        if len(left_edges) > 0:
-            road_left_bound = int(np.median(left_edges))
-        if len(right_edges) > 0:
-            road_right_bound = int(np.median(right_edges))
-        
-        # Si no se detectaron bordes, usar umbrales por defecto
-        if road_left_bound == 0 and road_right_bound == img_width:
-            # Usar detección basada en color/intensidad
-            # El asfalto suele ser más oscuro que los bordes
-            threshold = 80
-            dark_pixels = np.where(roi_gray < threshold)
-            
-            if len(dark_pixels[1]) > 0:
-                road_left_bound = int(np.min(dark_pixels[1]))
-                road_right_bound = int(np.max(dark_pixels[1]))
-        
-        # Margen de seguridad ajustable
-        safety_margin = 25
-        
-        # Verificar si el carro está dentro de los límites detectados
-        car_left = car_center_x - 30
-        car_right = car_center_x + 30
-        
-        on_road = (
-            car_left > road_left_bound + safety_margin and
-            car_right < road_right_bound - safety_margin
-        )
+        # MÉTODO HONESTO: El carro está ON TRACK si el modelo predijo correctamente
+        # Si predice mal, el carro se saldría de la pista en la vida real
+        on_road = prediction_correct
         
         # Actualizar contadores de rendimiento
         total_frames += 1
@@ -325,6 +253,7 @@ for subfolder in subfolders:
         draw_status.text(text_position, status_text, fill=status_color, font=font)
         
         # Agregar mensaje de advertencia si está fuera de pista
+        """
         if warning_text:
             warning_position = (10, 40)
             # Fondo rojo semi-transparente para mejor visibilidad
@@ -337,6 +266,7 @@ for subfolder in subfolders:
             # Dibujar texto de advertencia en blanco
             draw_status = ImageDraw.Draw(img)
             draw_status.text(warning_position, warning_text, fill=(255, 255, 255), font=font_warning)
+        """
 
         # Agregar estadísticas en tiempo real en la imagen
         success_pct = (success_count / total_frames * 100) if total_frames > 0 else 0
